@@ -1,0 +1,268 @@
+#!/usr/bin/env zsh
+
+typeset -ga antibody_opts=( warn_create_global warn_nested_var extended_glob )
+
+function __antibody_cmd_bundle {
+	emulate -L zsh; setopt local_options $antibody_opts
+
+	# parse the DSL for bundles
+	local bundles_tsv=$(__antibody_parsebundles $@)
+	bundles_tsv=(${(@f)${bundles}})
+	(( $#bundles )) || return 1
+
+	local row
+	local -a bundles
+	local -A bundle=()
+	for row in $bundles_tsv; do
+		bundle=( ${(ps/\t/)row} )
+		typeset -p bundle
+		#print -r -- $bundlestr
+	done
+}
+
+function __antibody_cmd_update {
+	emulate -L zsh; setopt local_options $antibody_opts
+	# TODO
+}
+
+function __antibody_cmd_purge {
+	emulate -L zsh; setopt local_options $antibody_opts
+	# TODO
+}
+
+function __antibody_cmd_list {
+	emulate -L zsh; setopt local_options $antibody_opts
+	# TODO
+}
+
+function __antibody_cmd_path {
+	local bundle=$(__antibody_bundledir "$@")
+	if [[ ! -d $bundle ]]; then
+		print -ru2 -- "antibody: error: '$1' does not exist in cloned paths"
+		return 1
+	fi
+	print -r -- $bundle
+}
+
+function __antibody_cmd_init {
+	emulate -L zsh; setopt local_options $antibody_opts
+	0=${(%):-%x}
+	local script=$(cat <<-EOS
+		#!/usr/bin/env zsh
+		antibody() {
+		  case "\$1" in
+		  bundle)
+		    source <( ${0:A} \$@ ) || ${0:A} \$@
+		    ;;
+		  *)
+		    ${0:A} \$@
+		    ;;
+		  esac
+		}
+
+		_antibody() {
+		  IFS=' ' read -A reply <<< "help bundle update home purge list init"
+		}
+		compctl -K _antibody antibody
+	EOS
+	)
+	print -rl $script
+}
+
+function __antibody_cmd_home {
+	emulate -L zsh; setopt local_options $antibody_opts
+	typeset -g REPLY=
+	local o_help
+	zparseopts -D -M -- h=o_help -help=h || return 1
+
+	if (( $#o_help )); then
+		__antibody_help
+		return
+	fi
+
+	local result
+	if [[ -n "$ANTIBODY_HOME" ]]; then
+		result=$ANTIBODY_HOME
+	elif [[ "${OSTYPE}" == darwin* ]]; then
+		result=$HOME/Library/Caches/antibody
+	elif [[ "${OSTYPE}" == (cygwin|msys)* ]]; then
+		result=${LOCALAPPDATA:-$LocalAppData}/antibody
+		if type cygpath > /dev/null; then
+			result=$(cygpath "$result")
+		fi
+	else
+		result=${XDG_CACHE_HOME:-$HOME/.cache}/antibody
+	fi
+
+	print -r -- $result
+}
+
+function __antibody_help {
+	emulate -L zsh; setopt local_options $antibody_opts
+	0=${(%):-%x}
+	local script=$(cat <<-EOS
+		usage: antibody [<flags>] <command> [<args> ...]
+
+		The fastest shell plugin manager
+
+		Flags:
+		  -h, --help            Show context-sensitive help (also try --help-long and --help-man).
+		  -v, --version         Show application version.
+
+		Commands:
+		  help [<command>...]
+		    Show help.
+
+		  bundle [<bundles>...]
+		    downloads a bundle and prints its source line
+
+		  update
+		    updates all previously bundled bundles
+
+		  home
+		    prints where antibody is cloning the bundles
+
+		  purge <bundle>
+		    purges a bundle from your computer
+
+		  list
+		    lists all currently installed bundles
+
+		  path <bundle>
+		    prints the path of a currently cloned bundle
+
+		  init
+		    initializes the shell so Antibody can work as expected
+	EOS
+	)
+	print -rl $script
+}
+
+function __antibody_version {
+	emulate -L zsh; setopt local_options $antibody_opts
+	print -r "antibody version 1.9.2"
+}
+
+function __antibody_bundledir {
+	emulate -L zsh; setopt local_options $antibody_opts
+	local bundle="$1"
+	if [[ "$bundle" != /* ]]; then
+		# sanitize URL for safe use as a dir name
+		local url=$bundle
+  		if [[ $bundle != *://* && $bundle != git@*:*/* ]]; then
+    		url=https://github.com/$bundle
+  		fi
+		url=${url%.git}
+		url=${url:gs/\@/-AT-}
+		url=${url:gs/\:/-COLON-}
+		url=${url:gs/\//-SLASH-}
+		bundle=$(__antibody_cmd_home)/$url
+	fi
+	print -r -- $bundle
+}
+
+function __antibody_parsebundles {
+	emulate -L zsh; setopt local_options $antibody_opts
+
+	# handle bundles as newline delimited arg strings,
+	# or as <redirected or piped| input
+	local data bundles=()
+	if [[ $# -gt 0 ]]; then
+		bundles=("${(s.\n.)${@}}")
+	elif [[ ! -t 0 ]]; then
+		while IFS= read -r data || [[ -n "$data" ]]; do
+		bundles+=($data)
+		done
+	fi
+	(( $#bundles )) || return 1
+
+	local bundlestr loc loctype
+	local -a bundle parts optstr annotations result
+
+	for bundlestr in $bundles; do
+		# normalize whitespace and remove comments
+		bundlestr=${bundlestr//[[:space:]]/ }
+		bundlestr=${bundlestr%%\#*}
+
+		# split on spaces into parts array and skip empty lines
+		parts=( ${(@s/ /)bundlestr} )
+		(( $#parts )) || continue
+
+		# the first element is the bundle location, and the remainder are a:b annotations
+		# split annotations into key/value pairs
+		loc=$parts[1]
+		case "$loc" in
+			(/|~|'$')*)  loctype=path    ;;
+			*://*)       loctype=url     ;;
+			*@*:*/*)     loctype=sshurl  ;;
+			*(:|@)*)     loctype='?'     ;;
+			*/*/*)       loctype=path    ;;
+			*/)          loctype=path    ;;
+			*/*)         loctype=repo    ;;
+			*)           loctype=word    ;;
+		esac
+
+		bundle=( loc $loc loctype $loctype )
+		annotations=( ${parts[@]:1} )
+		if (( $#annotations )); then
+			parts=( ${(@s/:/)annotations} )
+			(( ${#parts} % 2 == 0 )) || {
+				print -ru2 "antibody: error: bad annotation '$annotations'."
+				return 1
+			}
+			bundle+=( $parts )
+		fi
+
+		# output the parsed bundles as TSV
+		result+=(${(@pj/\t/)bundle})
+	done
+	print -rl -- $result
+}
+
+function __antibody_err_flag {
+	emulate -L zsh; setopt local_options $antibody_opts
+	print -r "antibody: error: unknown flag '$1', try --help"
+}
+
+function __antibody_err_arg {
+	emulate -L zsh; setopt local_options $antibody_opts
+	print -r "antibody: error: required argument '$1' not provided, try --help"
+}
+
+function __antibody_main {
+	while (( ${#} )); do
+		case $1 in
+			--)
+				shift
+				break
+				;;
+			-h|--help)
+				__antibody_help
+				return
+				;;
+			-v|--version)
+				__antibody_version
+				return
+				;;
+			-*)
+				__antibody_err_flag $1
+				return 2
+				;;
+			*)
+				break
+				;;
+		esac
+	done
+
+	if [[ -z "$1" ]]; then
+		__antibody_help
+	elif (( $+functions[__antibody_cmd_${1}] )); then
+		local cmd=${1}; shift
+		__antibody_cmd_${cmd} "$@"
+		return $?
+	else
+		print -ru2 "antibody: error: expected command but got \"$1\", try --help"
+		return 1
+	fi
+}
+__antibody_main "$@"
