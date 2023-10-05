@@ -1,23 +1,101 @@
 #!/usr/bin/env zsh
 
-typeset -ga antibody_opts=( warn_create_global warn_nested_var extended_glob )
+typeset -ga antibody_opts=( extended_glob no_monitor pipefail )
+typeset -g antibody_version='1.9.2'
+if [[ $ANTIBODY_TEST_MODE -eq 1 ]]; then
+	antibody_opts+=( warn_create_global warn_nested_var )
+	antibody_version=dev
+fi
 
 function __antibody_cmd_bundle {
 	emulate -L zsh; setopt local_options $antibody_opts
 
-	# parse the DSL for bundles
-	local bundles_tsv=$(__antibody_parsebundles $@)
-	bundles_tsv=(${(@f)${bundles}})
+	# handle bundles as newline delimited arg strings,
+	# or as <redirected or piped| input
+	local data bundles=()
+	if [[ $# -gt 0 ]]; then
+		bundles=("${(s.\n.)${@}}")
+	elif [[ ! -t 0 ]]; then
+		while IFS= read -r data || [[ -n "$data" ]]; do
+		bundles+=($data)
+		done
+	fi
 	(( $#bundles )) || return 1
 
-	local row
-	local -a bundles
-	local -A bundle=()
-	for row in $bundles_tsv; do
-		bundle=( ${(ps/\t/)row} )
-		typeset -p bundle
-		#print -r -- $bundlestr
+	local sed_cleanse_cmds=(
+		# Carriage returns to newlines.
+		-e 's/\r/\n/g'
+		# Tabs to spaces.
+		-e 's/\t/ /g'
+		# Collapse multiple spaces to one.
+		-e 's/ +/ /g'
+		# Trim leading spaces.
+		-e 's/^ +//g'
+		# Trim trailing spaces.
+		-e 's/ +$//g'
+		# Remove trailing comments.
+		-e 's/ +#.*$//g'
+		# Delete empty/comment lines.
+		-e '/^(#.+)?$/d'
+	)
+	local cleansed_bundles=$(print -rl -- $bundles | sed -E $sed_cleanse_cmds)
+
+	####
+	###local -a cleansed_bundles=("${(@f)$(sed -E $sed_cleanse_cmds $zsh_plugins)}")
+
+	local awk_giturls='
+		                           { bundle=""; branch="" }
+		# /kind:defer/               { print "https://github.com/romkatv/zsh-defer" }
+		$1~/^[^\/\$~]+\/[^\/]+$/   { bundle=giturl"/"$1 }
+		$1~/^(https?:|(ssh|git)@)/ { bundle=$1 }
+		match($0, /branch:[^ ]+/)  { branch=substr($0, RSTART+7, RLENGTH-7) }
+		branch!=""                 { printf "%s --branch %s\n",bundle,branch; next }
+		bundle!=""                 { print bundle }
+	'
+	local -a clone_bundles=("${(@f)$(
+		print -r -- $cleansed_bundles | awk -v giturl="${ANTIBODY_GITURL:-https://github.com}" $awk_giturls | sort | uniq
+	)}")
+
+	local clonestr giturl gitopts bundledir
+	local -a parts
+	for clonestr in $clone_bundles; do
+		parts=( ${(@s/ /)clonestr} )
+		giturl=$parts[1]
+		gitopts=(--quiet --depth 1 --recurse-submodules --shallow-submodules $parts[2,-1])
+		bundledir=$(__antibody_bundledir $giturl)
+		if [[ ! -d $bundledir ]]; then
+			git clone $gitopts $giturl $bundledir &
+		fi
 	done
+	wait
+
+	#printf 'clone %s\n' $clone_bundles
+	# awk_script='
+	# {
+	# printf "%s","__antibody_script "
+	# for (i=2; i<=NF; i++) {
+	# 	sub(/\:/, " ", $i)
+	# 	printf "--%s ",$i
+	# }
+	# printf "%s\n",$1
+	# }
+	# '
+
+	# sed -E $sed_cmds $zsh_plugins | awk $awk_script
+
+	# # parse the DSL for bundles
+	# local bundles_tsv=$(__antibody_parsebundles $@)
+	# bundles_tsv=(${(@f)${bundles}})
+	# (( $#bundles )) || return 1
+
+	# local row
+	# local -a bundles
+	# local -A bundle=()
+	# for row in $bundles_tsv; do
+	# 	bundle=( ${(ps/\t/)row} )
+	# 	typeset -p bundle
+	# 	#print -r -- $bundlestr
+	# done
 }
 
 function __antibody_cmd_update {
@@ -32,7 +110,16 @@ function __antibody_cmd_purge {
 
 function __antibody_cmd_list {
 	emulate -L zsh; setopt local_options $antibody_opts
-	# TODO
+	local bundledir url
+	local output=()
+	local bundles=($(__antibody_cmd_home)/*/.git(/N))
+
+	for bundledir in $bundles; do
+		bundledir=${bundledir:h}
+		url=$(git -C "$bundledir" config remote.origin.url)
+		output+=("$(printf '%-64s %s\n' $url $bundledir)")
+	done
+	(( $#output )) && printf '%s\n' ${(o)output}
 }
 
 function __antibody_cmd_path {
@@ -106,8 +193,8 @@ function __antibody_help {
 		The fastest shell plugin manager
 
 		Flags:
-		  -h, --help            Show context-sensitive help (also try --help-long and --help-man).
-		  -v, --version         Show application version.
+		  -h, --help           Show context-sensitive help.
+		  -v, --version        Show application version.
 
 		Commands:
 		  help [<command>...]
@@ -140,7 +227,7 @@ function __antibody_help {
 
 function __antibody_version {
 	emulate -L zsh; setopt local_options $antibody_opts
-	print -r "antibody version 1.9.2"
+	print -r "antibody version ${antibody_version}"
 }
 
 function __antibody_bundledir {
@@ -159,64 +246,6 @@ function __antibody_bundledir {
 		bundle=$(__antibody_cmd_home)/$url
 	fi
 	print -r -- $bundle
-}
-
-function __antibody_parsebundles {
-	emulate -L zsh; setopt local_options $antibody_opts
-
-	# handle bundles as newline delimited arg strings,
-	# or as <redirected or piped| input
-	local data bundles=()
-	if [[ $# -gt 0 ]]; then
-		bundles=("${(s.\n.)${@}}")
-	elif [[ ! -t 0 ]]; then
-		while IFS= read -r data || [[ -n "$data" ]]; do
-		bundles+=($data)
-		done
-	fi
-	(( $#bundles )) || return 1
-
-	local bundlestr loc loctype
-	local -a bundle parts optstr annotations result
-
-	for bundlestr in $bundles; do
-		# normalize whitespace and remove comments
-		bundlestr=${bundlestr//[[:space:]]/ }
-		bundlestr=${bundlestr%%\#*}
-
-		# split on spaces into parts array and skip empty lines
-		parts=( ${(@s/ /)bundlestr} )
-		(( $#parts )) || continue
-
-		# the first element is the bundle location, and the remainder are a:b annotations
-		# split annotations into key/value pairs
-		loc=$parts[1]
-		case "$loc" in
-			(/|~|'$')*)  loctype=path    ;;
-			*://*)       loctype=url     ;;
-			*@*:*/*)     loctype=sshurl  ;;
-			*(:|@)*)     loctype='?'     ;;
-			*/*/*)       loctype=path    ;;
-			*/)          loctype=path    ;;
-			*/*)         loctype=repo    ;;
-			*)           loctype=word    ;;
-		esac
-
-		bundle=( loc $loc loctype $loctype )
-		annotations=( ${parts[@]:1} )
-		if (( $#annotations )); then
-			parts=( ${(@s/:/)annotations} )
-			(( ${#parts} % 2 == 0 )) || {
-				print -ru2 "antibody: error: bad annotation '$annotations'."
-				return 1
-			}
-			bundle+=( $parts )
-		fi
-
-		# output the parsed bundles as TSV
-		result+=(${(@pj/\t/)bundle})
-	done
-	print -rl -- $result
 }
 
 function __antibody_err_flag {
